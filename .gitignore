@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.env
+venv/
+
+# Build artifacts
+build/
+dist/
+
+# Logs: ignore files but keep the folder
+logs/*
+!logs/.gitkeep
+
+# Local data/profiles and received files (optional; keep if you want them versioned)
+data/profiles/*
+
+# OS/editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
