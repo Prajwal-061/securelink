@@ -3,6 +3,7 @@ import logging
 import socket
 import threading
 import time
+import errno
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -24,6 +25,11 @@ class Peer:
 
 
 class TcpEngine:
+    # Retry configuration for mobile hotspot reliability
+    SEND_RETRY_ATTEMPTS = 3
+    SEND_RETRY_DELAY = 0.5  # seconds, exponential backoff
+    SOCKET_TIMEOUT = 10.0  # seconds, for send/recv operations
+    
     def __init__(self, recv_queue: Queue) -> None:
         self.recv_queue = recv_queue
         self.peers: dict[str, socket.socket] = {}
@@ -39,6 +45,8 @@ class TcpEngine:
             logger.info("TCP server listening on %s:%s", host, port)
             while True:
                 conn, addr = server.accept()
+                # Configure socket for reliability
+                self._configure_socket(conn)
                 peer_id = f"{addr[0]}:{addr[1]}"
                 logger.info("Accepted TCP client %s", peer_id)
                 self._register_peer(peer_id, conn)
@@ -50,6 +58,8 @@ class TcpEngine:
 
     def connect_to(self, ip: str, port: int) -> str:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Configure socket for reliability
+        self._configure_socket(sock)
         logger.debug("Connecting to %s:%s", ip, port)
         sock.connect((ip, port))
         peer_id = f"{ip}:{port}"
@@ -57,6 +67,22 @@ class TcpEngine:
         self._register_peer(peer_id, sock)
         threading.Thread(target=self._recv_loop, args=(peer_id, sock), daemon=True).start()
         return peer_id
+
+    def _configure_socket(self, sock: socket.socket) -> None:
+        """Configure socket for mobile hotspot reliability."""
+        try:
+            # Enable TCP keepalive to detect stale connections
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            
+            # Set timeout to detect hung connections
+            sock.settimeout(self.SOCKET_TIMEOUT)
+            
+            # TCP_NODELAY: send immediately, don't wait for buffer to fill (for low-latency messages)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            logger.debug("Socket configured with keepalive enabled and timeout %.1fs", self.SOCKET_TIMEOUT)
+        except Exception as exc:
+            logger.warning("Failed to configure socket: %s", exc)
 
     def _register_peer(self, peer_id: str, sock: socket.socket) -> None:
         with self._lock:
@@ -73,19 +99,77 @@ class TcpEngine:
         ).start()
 
     def _send_loop(self, peer_id: str, sock: socket.socket, send_queue: Queue) -> None:
+        """Send loop with retry logic for mobile hotspot reliability."""
         while True:
             packet = send_queue.get()
             if packet is None:
                 return
-            try:
-                sock.sendall(packet)
-                logger.debug("Sent packet to %s bytes=%s", peer_id, len(packet))
-            except OSError:
-                logger.warning("Send loop socket error for peer %s", peer_id)
-                self._drop_peer(peer_id)
-                return
+            
+            # Try to send with retries for transient errors
+            for attempt in range(1, self.SEND_RETRY_ATTEMPTS + 1):
+                try:
+                    sock.sendall(packet)
+                    logger.debug("Sent packet to %s bytes=%s", peer_id, len(packet))
+                    break  # Success, move to next packet
+                except socket.timeout:
+                    logger.warning(
+                        "Send timeout to peer %s (attempt %d/%d)",
+                        peer_id,
+                        attempt,
+                        self.SEND_RETRY_ATTEMPTS,
+                    )
+                    if attempt < self.SEND_RETRY_ATTEMPTS:
+                        # Transient timeout, retry with exponential backoff
+                        time.sleep(self.SEND_RETRY_DELAY * (2 ** (attempt - 1)))
+                        continue
+                    else:
+                        # Final attempt failed, drop peer
+                        logger.error("Send timeout exhausted for peer %s", peer_id)
+                        self._drop_peer(peer_id)
+                        return
+                except OSError as exc:
+                    # Check if it's a transient error that might recover
+                    if attempt < self.SEND_RETRY_ATTEMPTS and self._is_transient_error(exc):
+                        logger.warning(
+                            "Send error to peer %s: %s (attempt %d/%d, retrying)",
+                            peer_id,
+                            exc,
+                            attempt,
+                            self.SEND_RETRY_ATTEMPTS,
+                        )
+                        time.sleep(self.SEND_RETRY_DELAY * (2 ** (attempt - 1)))
+                        continue
+                    else:
+                        # Permanent error or final attempt failed
+                        logger.error("Send failed for peer %s: %s", peer_id, exc)
+                        self._drop_peer(peer_id)
+                        return
+            
+    def _is_transient_error(self, exc: OSError) -> bool:
+        """Check if the error might be transient (e.g., temporary network issue)."""
+        # Transient errors that might recover with retry
+        transient_codes = {
+            # Connection issues that might recover
+            errno.EAGAIN,      # Resource temporarily unavailable
+            errno.EWOULDBLOCK, # Would block (non-blocking socket)
+            errno.EINTR,       # Interrupted system call
+            errno.ECONNRESET,  # Connection reset (might reconnect)
+            errno.EPIPE,       # Broken pipe (might recover)
+        }
+        
+        # Check if error code suggests transient nature
+        if hasattr(exc, 'errno') and exc.errno in transient_codes:
+            return True
+        
+        # Check by message content
+        error_msg = str(exc).lower()
+        if any(pattern in error_msg for pattern in ['temporarily', 'try again', 'reset', 'timeout']):
+            return True
+        
+        return False
 
     def _recv_loop(self, peer_id: str, sock: socket.socket) -> None:
+        """Receive loop with better error handling for mobile connectivity."""
         while True:
             try:
                 header, payload = recv_packet(sock)
@@ -96,6 +180,10 @@ class TcpEngine:
                     header.packet_type.name,
                     header.payload_size,
                 )
+            except socket.timeout:
+                logger.debug("Recv timeout from peer %s (connection may be idle)", peer_id)
+                # Timeout is not necessarily fatal on mobile networks; continue listening
+                continue
             except Exception as exc:
                 self.recv_queue.put((peer_id, "error", str(exc).encode("utf-8")))
                 logger.warning("Receive loop ended for %s: %s", peer_id, exc)

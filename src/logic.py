@@ -48,6 +48,12 @@ class LogicController:
         self.ack_events: dict[tuple[str, int], threading.Event] = {}
         self._ack_lock = threading.Lock()
         self._msg_counter = 0
+        
+        # Connection retry tracking for mobile hotspot resilience
+        self.reconnect_attempts: dict[str, int] = {}  # peer_id -> attempt count
+        self.reconnect_last_attempt: dict[str, float] = {}  # peer_id -> timestamp
+        self.RECONNECT_BACKOFF_BASE = 0.5  # seconds, exponential backoff
+        self.RECONNECT_BACKOFF_MAX = 15.0  # seconds, max backoff
 
     def start(self) -> None:
         logger.info("Logic start username=%s host=%s port=%s", self.username, self.listen_host, self.listen_port)
@@ -214,13 +220,28 @@ class LogicController:
     ) -> None:
         resolved_peer_id = self._ensure_peer_connection(peer_id)
         if not resolved_peer_id:
-            self.ui_queue.put(
-                {
-                    "event": "status",
-                    "text": f"Message not sent. Could not connect to {peer_id}.",
-                }
-            )
-            logger.warning("Text send aborted; no active connection peer=%s", peer_id)
+            # Check if we're in backoff
+            canonical = self._canonical_peer_id(peer_id)
+            attempt = self.reconnect_attempts.get(canonical, 0)
+            if attempt > 0:
+                backoff = min(
+                    self.RECONNECT_BACKOFF_BASE * (2 ** (attempt - 1)),
+                    self.RECONNECT_BACKOFF_MAX
+                )
+                self.ui_queue.put(
+                    {
+                        "event": "status",
+                        "text": f"Reconnecting to {peer_id} (attempt {attempt}, retrying in ~{backoff:.1f}s)...",
+                    }
+                )
+            else:
+                self.ui_queue.put(
+                    {
+                        "event": "status",
+                        "text": f"Message not sent. Could not connect to {peer_id}.",
+                    }
+                )
+            logger.warning("Text send aborted; no active connection peer=%s attempt=%d", peer_id, attempt)
             return
 
         message_id = int(time.time() * 1000000)
@@ -493,6 +514,9 @@ class LogicController:
         canonical = self._canonical_peer_id(peer_id)
         connected = set(self.net.get_connected_peers())
         if canonical in connected:
+            # Clear any previous reconnect tracking
+            self.reconnect_attempts.pop(canonical, None)
+            self.reconnect_last_attempt.pop(canonical, None)
             return canonical
 
         try:
@@ -502,10 +526,18 @@ class LogicController:
             logger.warning("Invalid peer id format: %s", canonical)
             return None
 
+        # Check if we should backoff before attempting reconnection
+        if not self._should_attempt_reconnect(canonical):
+            logger.debug("Backoff in effect for peer %s, skipping connection attempt", canonical)
+            return None
+
         # Reuse any live socket from the same host when canonical id is not available.
         for connected_peer in connected:
             if connected_peer.startswith(f"{host}:"):
                 self.peer_aliases[canonical] = connected_peer
+                # Clear reconnect tracking on successful reuse
+                self.reconnect_attempts.pop(canonical, None)
+                self.reconnect_last_attempt.pop(canonical, None)
                 return connected_peer
 
         try:
@@ -514,11 +546,44 @@ class LogicController:
             self.outbound_targets[connected_peer_id] = (host, port)
             self.peer_last_seen[connected_peer_id] = time.time()
             self.peer_aliases[canonical] = connected_peer_id
+            # Clear reconnect tracking on successful connection
+            self.reconnect_attempts.pop(canonical, None)
+            self.reconnect_last_attempt.pop(canonical, None)
             logger.info("Connected on-demand peer=%s via=%s", canonical, connected_peer_id)
             return connected_peer_id
         except Exception as exc:
             logger.warning("On-demand connect failed peer=%s error=%s", canonical, exc)
+            # Track failed reconnection attempt
+            self._record_reconnect_attempt(canonical)
             return None
+
+    def _should_attempt_reconnect(self, peer_id: str) -> bool:
+        """Check if enough time has passed for reconnection backoff."""
+        now = time.time()
+        last_attempt = self.reconnect_last_attempt.get(peer_id, 0)
+        attempt_count = self.reconnect_attempts.get(peer_id, 0)
+        
+        if attempt_count == 0:
+            return True
+        
+        # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s, max 15s
+        backoff = min(
+            self.RECONNECT_BACKOFF_BASE * (2 ** (attempt_count - 1)),
+            self.RECONNECT_BACKOFF_MAX
+        )
+        
+        return (now - last_attempt) >= backoff
+
+    def _record_reconnect_attempt(self, peer_id: str) -> None:
+        """Record a failed reconnection attempt for backoff tracking."""
+        self.reconnect_attempts[peer_id] = self.reconnect_attempts.get(peer_id, 0) + 1
+        self.reconnect_last_attempt[peer_id] = time.time()
+        attempt = self.reconnect_attempts[peer_id]
+        if attempt <= 3:
+            logger.info("Reconnection backoff for peer %s attempt %d", peer_id, attempt)
+        elif attempt % 5 == 0:
+            # Log every 5th attempt to avoid log spam
+            logger.info("Reconnection backoff for peer %s attempt %d (continued)", peer_id, attempt)
 
     def _record_file_event(self, peer_id: str, sender: str, file_name: str, direction: str) -> None:
         message_id = int(time.time() * 1000000)
