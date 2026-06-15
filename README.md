@@ -78,3 +78,4 @@ scripts\build_windows.bat
 - End-to-end LAN runbook: `docs/LAN_RUNBOOK.md`
 - Firewall guidance: `docs/FIREWALL.md`
 
+# securelink
